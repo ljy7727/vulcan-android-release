@@ -1,0 +1,208 @@
+name: Renew signed stable metadata
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: stable-pointer
+  cancel-in-progress: false
+jobs:
+  renew:
+    if: github.repository == 'ljy7727/vulcan-android-release' && github.ref == 'refs/heads/main'
+    environment: android-metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, verified upstream commit
+        with:
+          persist-credentials: false
+      - name: Verify public APK and renew signed pointer with CAS
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST_KEY_B64: ${{ secrets.MANIFEST_PKCS8_PEM_BASE64 }}
+        run: |
+          umask 077
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import tempfile
+          import time
+          import urllib.request
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          KEY_ID = "manifest-2026-01"
+          REPO = "ljy7727/vulcan-android-release"
+          CERT = "a0c7fbac512d21f450950fc760bc00244378ab1034fd9e45791e4e48cfd35e98"
+          API = "https://api.github.com/repos/" + REPO
+
+          TRUSTED_SPKI = base64.b64decode(
+              "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEJPa2qcj1XD1oGLoa1NntTbwqHlK44u6qjnXNxFDetbJ95kg/13WDx4qwHDHEgHnm7msD9DIIi/DbLpt5SUcAA=="
+          )
+          MAX_ENVELOPE_BYTES = 64 * 1024
+          FIELDS = {
+              "protocol", "sequence", "applicationId", "channel", "versionCode", "versionName",
+              "minSdk", "abis", "apkUrl", "apkSha256", "apkCertificateSha256", "apkBytes",
+              "publishedAt", "expiresAt", "withdrawn",
+          }
+
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+
+          def _unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  require(key not in result, "Duplicate JSON field: " + key)
+                  result[key] = value
+              return result
+
+
+          def _json(raw):
+              return json.loads(raw.decode("utf-8", errors="strict"), object_pairs_hook=_unique_object,
+                                parse_constant=lambda value: (_ for _ in ()).throw(ValueError("Invalid JSON constant: " + value)))
+
+
+          def _base64(value):
+              require(type(value) is str and len(value) % 4 == 0, "Nonstandard Base64")
+              raw = base64.b64decode(value, validate=True)
+              require(base64.b64encode(raw).decode("ascii") == value, "Noncanonical Base64")
+              return raw
+
+
+          def _validate_payload(value, now):
+              require(type(value) is dict and set(value) == FIELDS, "Unknown or missing payload fields")
+              for name in ("protocol", "sequence", "versionCode", "minSdk", "apkBytes", "publishedAt", "expiresAt"):
+                  require(type(value[name]) is int, name + " must be an integer")
+              require(value["protocol"] == 1, "Unknown protocol")
+              require(0 < value["sequence"] <= 2**63 - 1, "Invalid sequence")
+              require(0 < value["versionCode"] <= 2**31 - 1, "Invalid versionCode")
+              require(value["applicationId"] == "com.heda.vulcan.next" and value["channel"] == "stable", "Wrong target")
+              require(type(value["versionName"]) is str and 0 < len(value["versionName"]) <= 128 and value["versionName"].strip(), "Invalid versionName")
+              require(26 <= value["minSdk"] <= 2**31 - 1, "Invalid minSdk")
+              require(type(value["abis"]) is list and 0 < len(value["abis"]) <= 32 and
+                      all(type(abi) is str and abi.strip() and len(abi) <= 64 for abi in value["abis"]), "Invalid ABIs")
+              require(type(value["withdrawn"]) is bool, "withdrawn must be boolean")
+              for name in ("apkSha256", "apkCertificateSha256"):
+                  require(type(value[name]) is str and re.fullmatch(r"[0-9a-fA-F]{64}", value[name]), "Invalid " + name)
+              require(0 < value["apkBytes"] <= 256 * 1024 * 1024, "Invalid APK size")
+              require(0 < value["publishedAt"] <= now + 300 and value["expiresAt"] <= 2**63 - 1 and
+                      0 < value["expiresAt"] - value["publishedAt"] <= 30 * 86400, "Invalid validity interval")
+              # Authentic expired metadata may be renewed; APK identity stays unchanged.
+              require(type(value["apkUrl"]) is str and len(value["apkUrl"]) <= 2048, "Invalid APK URL")
+              url = urlsplit(value["apkUrl"])
+              require(url.scheme == "https" and url.netloc == "github.com" and not url.query and not url.fragment,
+                      "Untrusted APK URL")
+              require(re.fullmatch(r"https://github\.com/ljy7727/vulcan-android-release/releases/download/"
+                                   r"[A-Za-z0-9_][A-Za-z0-9_.-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*\.apk", value["apkUrl"]),
+                      "Unexpected release repository or asset path")
+
+
+          def verify_current(envelope_bytes, now, *, trusted_spki=TRUSTED_SPKI):
+              require(0 < len(envelope_bytes) <= MAX_ENVELOPE_BYTES, "Invalid envelope size")
+              envelope = _json(envelope_bytes)
+              require(type(envelope) is dict and set(envelope) == {"keyId", "payload", "signature"}, "Invalid envelope")
+              require(envelope["keyId"] == KEY_ID, "Unknown keyId")
+              payload = _base64(envelope["payload"])
+              signature = _base64(envelope["signature"])
+              require(len(payload) <= 48 * 1024 and 8 <= len(signature) <= 72, "Invalid signed content size")
+              with tempfile.TemporaryDirectory() as directory:
+                  root = Path(directory)
+                  (root / "public.der").write_bytes(trusted_spki)
+                  (root / "payload").write_bytes(payload)
+                  (root / "signature").write_bytes(signature)
+                  subprocess.run(["openssl", "pkey", "-pubin", "-inform", "DER", "-in", str(root / "public.der"),
+                                  "-out", str(root / "public.pem")], check=True, capture_output=True)
+                  subprocess.run(["openssl", "dgst", "-sha256", "-verify", str(root / "public.pem"),
+                                  "-signature", str(root / "signature"), str(root / "payload")], check=True, capture_output=True)
+              # No payload JSON is interpreted until its exact raw bytes verify.
+              value = _json(payload)
+              _validate_payload(value, now)
+              return value
+
+
+
+          def api(path, value=None, method=None):
+              headers = {"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                         "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
+                         "Content-Type": "application/json", "User-Agent": "vulcan-metadata-renew"}
+              request = urllib.request.Request(API + path, headers=headers, method=method,
+                                              data=None if value is None else json.dumps(value).encode())
+              with urllib.request.urlopen(request, timeout=90) as response:
+                  return _json(response.read(256 * 1024))
+
+
+          def download_public(url, size):
+              # No API authorization header is ever forwarded to the public download/CDN.
+              with urllib.request.urlopen(url, timeout=90) as response:
+                  require(urlsplit(response.geturl()).scheme == "https", "Insecure APK redirect")
+                  return response.read(size + 1)
+
+
+          def renew(current, key, now, *, trusted_spki=TRUSTED_SPKI, download=download_public):
+              require(type(now) is int and 0 < now <= 2**63 - 1 - 29 * 86400, "Invalid current time")
+              old = verify_current(current, now, trusted_spki=trusted_spki)
+              require(old["apkCertificateSha256"] == CERT, "Unexpected APK signer certificate")
+              require(old["sequence"] < 2**63 - 1, "Sequence overflow")
+              actual_public = subprocess.run(["openssl", "pkey", "-in", str(key), "-pubout", "-outform", "DER"],
+                                             check=True, capture_output=True).stdout
+              require(actual_public == trusted_spki, "Signing key does not match fixed trust root")
+              apk = download(old["apkUrl"], old["apkBytes"])
+              require(len(apk) == old["apkBytes"] and hashlib.sha256(apk).hexdigest() == old["apkSha256"],
+                      "Public APK hash or size mismatch")
+              new = dict(old, sequence=old["sequence"] + 1, publishedAt=now, expiresAt=now + 29 * 86400)
+              _validate_payload(new, now)
+              raw = json.dumps(new, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+              with tempfile.TemporaryDirectory(dir=key.parent) as directory:
+                  payload_file = Path(directory) / "payload"
+                  payload_file.write_bytes(raw)
+                  signature = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(key), str(payload_file)],
+                                             check=True, capture_output=True).stdout
+              envelope = json.dumps(dict(keyId=KEY_ID, payload=base64.b64encode(raw).decode("ascii"),
+                                         signature=base64.b64encode(signature).decode("ascii")),
+                                    separators=(",", ":")).encode("utf-8")
+              verify_current(envelope, now, trusted_spki=trusted_spki)
+              return envelope
+
+
+          def renew_current(key, now, *, api_call=api, trusted_spki=TRUSTED_SPKI, download=download_public):
+              current = api_call("/contents/stable.json?ref=main")
+              require(type(current) is dict and current.get("encoding") == "base64", "Expected existing stable.json")
+              require(type(current.get("sha")) is str and re.fullmatch(r"[0-9a-f]{40}", current["sha"]), "Invalid blob SHA")
+              content = current.get("content")
+              require(type(content) is str and len(content) <= 2 * MAX_ENVELOPE_BYTES, "Invalid pointer content")
+              raw = _base64(content.replace("\n", "").replace("\r", ""))
+              envelope = renew(raw, key, now, trusted_spki=trusted_spki, download=download)
+              # Exactly one CAS PUT. A publisher or renewal that changed the blob wins;
+              # propagate 409/422 without retry, deleting files, or overwriting that winner.
+              api_call("/contents/stable.json", dict(message="Renew signed Android stable metadata",
+                       branch="main", sha=current["sha"], content=base64.b64encode(envelope).decode("ascii")), "PUT")
+              return envelope
+
+
+          def main():
+              require(os.environ.get("GITHUB_REPOSITORY") == REPO, "Wrong repository")
+              require(os.environ.get("GITHUB_REF") == "refs/heads/main", "Wrong branch")
+              with tempfile.TemporaryDirectory(prefix="vulcan-metadata-", dir=os.environ["RUNNER_TEMP"]) as directory:
+                  key = Path(directory) / "manifest-key.pem"
+                  try:
+                      key.write_bytes(_base64(os.environ.pop("MANIFEST_KEY_B64")))
+                      key.chmod(0o600)
+                      renew_current(key, int(time.time()))
+                  finally:
+                      key.unlink(missing_ok=True)
+              print("Public APK verified; signed metadata renewed using CAS.")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
